@@ -75,6 +75,14 @@ async function compileHandlers(handlers, label) {
         treeShaking: true,
         allowOverwrite: true,
         loader: { '.ts': 'ts' },
+        // Vercel-edge-only deps: WASM/native binaries that esbuild cannot
+        // bundle for the node sidecar. Safe to leave as unresolved imports —
+        // any handler that actually needs them (e.g. api/brief/carousel/*)
+        // runs on Vercel edge where node_modules is available at runtime.
+        // Without this, PR #3174 (satori + @resvg/resvg-wasm) broke every
+        // Railway build since 2026-04-18 because @resvg auto-installs
+        // native siblings carrying .node binaries that esbuild cannot load.
+        external: ['satori', '@resvg/*', 'yoga-wasm-web'],
       });
       const { size } = await stat(outfile);
       return { file: path.relative(projectRoot, outfile), size };
