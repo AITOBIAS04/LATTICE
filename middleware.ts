@@ -75,7 +75,11 @@ function isAllowedHost(host: string): boolean {
 // so bot/crawler traffic does not burn Fluid Active CPU on Hobby tier.
 const ECHELON_ONLY_HOSTS = new Set(['testerapi-five-silk.vercel.app']);
 
-const WM_KEY_SHAPE_EARLY = /^wm_[a-f0-9]{40}$/;
+// Echelon's live key is 48 hex chars; WM's original generateKey() emits 40.
+// Accept any 32+ hex length after `wm_` to tolerate both formats. Real key
+// validation (SHA-256 against WORLDMONITOR_VALID_KEYS) still happens
+// downstream in server/gateway.ts — this is just an edge shape gate.
+const WM_KEY_SHAPE_EARLY = /^wm_[a-f0-9]{32,}$/;
 
 // Paths a monitoring/health probe may hit unauthenticated even on Echelon-only
 // hosts. Keep this list narrow — anything here is fully public on the alias.
