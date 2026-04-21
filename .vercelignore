@@ -25,29 +25,31 @@ target/
 # that run on Railway per docs/architecture, NOT on Vercel edge.
 # =============================================================================
 
-# Relay + 135 seed cron scripts (scripts/ais-relay.cjs + scripts/seed-*.mjs)
-scripts/
+# Relay + seed cron scripts. LEADING SLASH anchors to repo root so we
+# don't accidentally exclude nested scripts/ directories that the blog-site
+# build actually needs (e.g. blog-site/scripts/generate-og-images.mjs).
+/scripts/
 
 # Docker/container build artefacts (Railway and local compose, not Vercel)
-docker/
-Dockerfile
-Dockerfile.*
-docker-compose.yml
-docker-compose.override.yml
+/docker/
+/Dockerfile
+/Dockerfile.*
+/docker-compose.yml
+/docker-compose.override.yml
 
 # Railway builder config (Vercel doesn't read nixpacks)
-nixpacks.toml
+/nixpacks.toml
 
-# Test suites and build tools not needed at runtime
-tests/
-e2e/
-proto/
-consumer-prices-core/
+# Test suites at repo root (not nested tests/ inside packages which may matter)
+/tests/
+/e2e/
+/proto/
+/consumer-prices-core/
 
 # Windsurf / IDE / agent scratch
-.windsurf/
-.agent/
-.agents/
-.claude/
-.factory/
-.planning/
+/.windsurf/
+/.agent/
+/.agents/
+/.claude/
+/.factory/
+/.planning/
