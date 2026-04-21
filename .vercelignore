@@ -25,10 +25,14 @@ target/
 # that run on Railway per docs/architecture, NOT on Vercel edge.
 # =============================================================================
 
-# Relay + seed cron scripts. LEADING SLASH anchors to repo root so we
-# don't accidentally exclude nested scripts/ directories that the blog-site
-# build actually needs (e.g. blog-site/scripts/generate-og-images.mjs).
-/scripts/
+# Relay + seed cron scripts. Tried excluding /scripts/ wholesale — broke
+# the Vite build because src/ imports two JSON files from there:
+#   scripts/shared/country-port-clusters.json
+#   scripts/data/prediction-tags.json
+# Marginal deploy-size reduction wasn't worth the build-gate breakage,
+# and Fluid Active CPU burn comes from function invocations, not build
+# context size. Left scripts/ in the deploy; the middleware auth gate
+# (see middleware.ts ECHELON_ONLY_HOSTS) is the actual CPU saver.
 
 # Docker/container build artefacts (Railway and local compose, not Vercel)
 /docker/
