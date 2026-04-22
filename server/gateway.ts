@@ -16,7 +16,7 @@ import { validateApiKey } from '../api/_api-key.js';
 import { mapErrorToResponse } from './error-mapper';
 import { checkRateLimit, checkEndpointRateLimit, hasEndpointRatePolicy } from './_shared/rate-limit';
 import { drainResponseHeaders } from './_shared/response-headers';
-import { checkEntitlement, getRequiredTier } from './_shared/entitlement-check';
+import { checkEntitlement, getRequiredTier, getEntitlements } from './_shared/entitlement-check';
 import { resolveSessionUserId } from './_shared/auth-session';
 import type { ServerOptions } from '../src/generated/server/worldmonitor/seismology/v1/service_server';
 
@@ -218,9 +218,17 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/supply-chain/v1/get-country-chokepoint-index': 'slow-browser',
   '/api/supply-chain/v1/get-bypass-options': 'slow-browser',
   '/api/supply-chain/v1/get-country-cost-shock': 'slow-browser',
+  '/api/supply-chain/v1/get-country-products': 'slow-browser',
+  '/api/supply-chain/v1/get-multi-sector-cost-shock': 'slow-browser',
   '/api/supply-chain/v1/get-sector-dependency': 'slow-browser',
   '/api/supply-chain/v1/get-route-explorer-lane': 'slow-browser',
   '/api/supply-chain/v1/get-route-impact': 'slow-browser',
+  // Scenario engine: list-scenario-templates is a compile-time constant catalog;
+  // daily tier gives browser max-age=3600 matching the legacy /api/scenario/v1/templates
+  // endpoint header. get-scenario-status is premium-gated — gateway short-circuits
+  // to 'slow-browser' but the entry is still required by tests/route-cache-tier.test.mjs.
+  '/api/scenario/v1/list-scenario-templates': 'daily',
+  '/api/scenario/v1/get-scenario-status': 'slow-browser',
   '/api/health/v1/list-disease-outbreaks': 'slow',
   '/api/health/v1/list-air-quality-alerts': 'fast',
   '/api/intelligence/v1/get-social-velocity': 'fast',
@@ -241,6 +249,13 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/intelligence/v1/get-regional-brief': 'slow',
   '/api/resilience/v1/get-resilience-score': 'slow',
   '/api/resilience/v1/get-resilience-ranking': 'slow',
+
+  // Partner-facing shipping/v2. route-intelligence is premium-gated; gateway
+  // short-circuits to slow-browser. Entry required by tests/route-cache-tier.test.mjs.
+  '/api/v2/shipping/route-intelligence': 'slow-browser',
+  // GET /webhooks lists caller's webhooks — premium-gated; short-circuited to
+  // slow-browser. Entry required by tests/route-cache-tier.test.mjs.
+  '/api/v2/shipping/webhooks': 'slow-browser',
 };
 
 import { PREMIUM_RPC_PATHS } from '../src/shared/premium-paths';
@@ -342,7 +357,6 @@ export function createDomainGateway(
     // User API keys on PREMIUM_RPC_PATHS need verified pro-tier entitlement.
     // Admin keys (WORLDMONITOR_VALID_KEYS) bypass this since they are operator-issued.
     if (isUserApiKey && needsLegacyProBearerGate && sessionUserId) {
-      const { getEntitlements } = await import('./_shared/entitlement-check');
       const ent = await getEntitlements(sessionUserId);
       if (!ent || !ent.features.apiAccess) {
         return new Response(JSON.stringify({ error: 'API access subscription required' }), {
@@ -364,13 +378,34 @@ export function createDomainGateway(
               headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
           }
-          if (session.role !== 'pro') {
+          // Accept EITHER a Clerk 'pro' role OR a Convex Dodo entitlement with
+          // tier >= 1. The Dodo webhook pipeline writes Convex entitlements but
+          // does NOT sync Clerk publicMetadata.role, so a paying subscriber's
+          // session.role stays 'free' indefinitely. A Clerk-role-only check
+          // would block every paying user on legacy premium endpoints despite
+          // a valid Dodo subscription. This mirrors the two-signal logic in
+          // server/_shared/premium-check.ts::isCallerPremium so the gateway
+          // gate and the per-handler gate agree on who is premium — same split
+          // already documented at the frontend layer (panel-gating.ts:11-27).
+          //
+          // Note: validateBearerToken returns session.userId directly, so we
+          // use it without needing to resolveSessionUserId() — sessionUserId
+          // is intentionally only resolved for ENDPOINT_ENTITLEMENTS-tier-gated
+          // endpoints earlier (line 292) to avoid a JWKS lookup on every
+          // legacy premium request. validateBearerToken already does its own
+          // verification here (line 360) and exposes userId on the result.
+          let allowed = session.role === 'pro';
+          if (!allowed && session.userId) {
+            const ent = await getEntitlements(session.userId);
+            allowed = !!ent && ent.features.tier >= 1 && ent.validUntil >= Date.now();
+          }
+          if (!allowed) {
             return new Response(JSON.stringify({ error: 'Pro subscription required' }), {
               status: 403,
               headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
           }
-          // Valid pro session — fall through to route handling
+          // Valid pro session (Clerk role OR Dodo entitlement) — fall through to route handling.
         } else {
           return new Response(JSON.stringify({ error: keyCheck.error, _debug: (keyCheck as any)._debug }), {
             status: 401,
@@ -382,22 +417,6 @@ export function createDomainGateway(
           status: 401,
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
-      }
-    }
-
-    // Bearer role check — authenticated users who bypassed the API key gate still
-    // need a pro role for PREMIUM_RPC_PATHS (entitlement check below handles tier-gated).
-    if (sessionUserId && !keyCheck.valid && needsLegacyProBearerGate) {
-      const authHeader = request.headers.get('Authorization');
-      if (authHeader?.startsWith('Bearer ')) {
-        const { validateBearerToken } = await import('./auth-session');
-        const session = await validateBearerToken(authHeader.slice(7));
-        if (!session.valid || session.role !== 'pro') {
-          return new Response(JSON.stringify({ error: 'Pro subscription required' }), {
-            status: 403,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
-        }
       }
     }
 

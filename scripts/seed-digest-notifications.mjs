@@ -36,9 +36,17 @@ import {
   groupEligibleRulesByUser,
   shouldExitNonZero as shouldExitOnBriefFailures,
 } from './lib/brief-compose.mjs';
+import { issueSlotInTz } from '../shared/brief-filter.js';
 import { enrichBriefEnvelopeWithLLM } from './lib/brief-llm.mjs';
+import { parseDigestOnlyUser } from './lib/digest-only-user.mjs';
 import { assertBriefEnvelope } from '../server/_shared/brief-render.js';
 import { signBriefUrl, BriefUrlError } from './lib/brief-url-sign.mjs';
+import {
+  deduplicateStories,
+  groupTopicsPostDedup,
+  readOrchestratorConfig,
+} from './lib/brief-dedup.mjs';
+import { stripSourceSuffix } from './lib/brief-dedup-jaccard.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -77,6 +85,19 @@ const AI_SUMMARY_CACHE_TTL = 3600; // 1h
 const AI_DIGEST_ENABLED = process.env.AI_DIGEST_ENABLED !== '0';
 const ENTITLEMENT_CACHE_TTL = 900; // 15 min
 
+// Absolute importance-score floor applied to the digest AFTER dedup.
+// Mirrors the realtime notification-relay gate (IMPORTANCE_SCORE_MIN)
+// but lives on the brief/digest side so operators can tune them
+// independently — e.g. let realtime page at score>=63 while the brief
+// digest drops anything <50. Default 0 = no filtering; ship disabled
+// so this PR is a no-op until Railway flips the env. Setting the var
+// to any positive integer drops every cluster whose representative
+// currentScore is below it.
+function getDigestScoreMin() {
+  const raw = Number.parseInt(process.env.DIGEST_SCORE_MIN ?? '0', 10);
+  return Number.isInteger(raw) && raw >= 0 ? raw : 0;
+}
+
 // ── Brief composer (consolidation of the retired seed-brief-composer) ──────
 
 const BRIEF_URL_SIGNING_SECRET = process.env.BRIEF_URL_SIGNING_SECRET ?? '';
@@ -106,11 +127,95 @@ const BRIEF_SIGNING_SECRET_MISSING =
 // the email's AI summary during a provider outage).
 const BRIEF_LLM_ENABLED = process.env.BRIEF_LLM_ENABLED !== '0';
 
+// Phase 3c — analyst-backed whyMatters enrichment via an internal Vercel
+// edge endpoint. When the endpoint is reachable + returns a string, it
+// takes priority over the direct-Gemini path. On any failure the cron
+// falls through to its existing Gemini cache+LLM chain. Env override
+// lets local dev point at a preview deployment or `localhost:3000`.
+const BRIEF_WHY_MATTERS_ENDPOINT_URL =
+  process.env.BRIEF_WHY_MATTERS_ENDPOINT_URL ??
+  `${WORLDMONITOR_PUBLIC_BASE_URL}/api/internal/brief-why-matters`;
+
+/**
+ * POST one story to the analyst whyMatters endpoint. Returns the
+ * string on success, null on any failure (auth, non-200, parse error,
+ * timeout, missing value). The cron's `generateWhyMatters` is
+ * responsible for falling through to the direct-Gemini path on null.
+ *
+ * Ground-truth signal: logs `source` (cache|analyst|gemini) and
+ * `producedBy` (analyst|gemini|null) at the call site so the cron's
+ * log stream has a forensic trail of which path actually produced each
+ * story's whyMatters — needed for shadow-diff review and for the
+ * "stop writing v2" decision once analyst coverage is proven.
+ * (See feedback_gate_on_ground_truth_not_configured_state.md.)
+ */
+async function callAnalystWhyMatters(story) {
+  if (!RELAY_SECRET) return null;
+  // Forward a trimmed story payload so the endpoint only sees the
+  // fields it validates. `description` is NEW for prompt-v2 — when
+  // upstream has a real one (falls back to headline via
+  // shared/brief-filter.js:134), it gives the LLM a grounded sentence
+  // beyond the headline. Skip when it equals the headline (no signal).
+  const payload = {
+    headline: story.headline ?? '',
+    source: story.source ?? '',
+    threatLevel: story.threatLevel ?? '',
+    category: story.category ?? '',
+    country: story.country ?? '',
+  };
+  if (
+    typeof story.description === 'string' &&
+    story.description.length > 0 &&
+    story.description !== story.headline
+  ) {
+    payload.description = story.description;
+  }
+  try {
+    const resp = await fetch(BRIEF_WHY_MATTERS_ENDPOINT_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RELAY_SECRET}`,
+        'Content-Type': 'application/json',
+        // Explicit UA — Node undici's default is short/empty enough to
+        // trip middleware.ts's "No user-agent or suspiciously short"
+        // 403 path. Defense-in-depth alongside the PUBLIC_API_PATHS
+        // allowlist. Distinct from ops curl / UptimeRobot so log grep
+        // disambiguates cron traffic from operator traffic.
+        'User-Agent': 'worldmonitor-digest-notifications/1.0',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ story: payload }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[digest] brief-why-matters endpoint HTTP ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    if (!data || typeof data.whyMatters !== 'string') return null;
+    // Emit the ground-truth provenance at the call site. `source` tells
+    // us cache vs. live; `producedBy` tells us which LLM wrote the
+    // string (or the cached value's original producer on cache hits).
+    const src = typeof data.source === 'string' ? data.source : 'unknown';
+    const producedBy = typeof data.producedBy === 'string' ? data.producedBy : 'unknown';
+    console.log(
+      `[brief-llm] whyMatters source=${src} producedBy=${producedBy} hash=${data.hash ?? 'n/a'}`,
+    );
+    return data.whyMatters;
+  } catch (err) {
+    console.warn(
+      `[digest] brief-why-matters endpoint call failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
 // Dependencies injected into brief-llm.mjs. Defined near the top so
 // the upstashRest helper below is in scope when this closure runs
 // inside composeAndStoreBriefForUser().
 const briefLlmDeps = {
   callLLM,
+  callAnalystWhyMatters,
   async cacheGet(key) {
     const raw = await upstashRest('GET', key);
     if (typeof raw !== 'string' || raw.length === 0) return null;
@@ -224,65 +329,14 @@ function matchesSensitivity(ruleSensitivity, severity) {
   return severity === 'critical';
 }
 
-// ── Fuzzy deduplication ──────────────────────────────────────────────────────
-
-const STOP_WORDS = new Set([
-  'the','a','an','in','on','at','to','for','of','is','are','was','were',
-  'has','have','had','be','been','by','from','with','as','it','its',
-  'says','say','said','according','reports','report','officials','official',
-  'us','new','will','can','could','would','may','also','who','that','this',
-  'after','about','over','more','up','out','into','than','some','other',
-]);
-
-function stripSourceSuffix(title) {
-  return title
-    .replace(/\s*[-–—]\s*[\w\s.]+\.(?:com|org|net|co\.uk)\s*$/i, '')
-    .replace(/\s*[-–—]\s*(?:Reuters|AP News|BBC|CNN|Al Jazeera|France 24|DW News|PBS NewsHour|CBS News|NBC|ABC|Associated Press|The Guardian|NOS Nieuws|Tagesschau|CNBC|The National)\s*$/i, '');
-}
-
-function extractTitleWords(title) {
-  return new Set(
-    stripSourceSuffix(title)
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, '')
-      .split(/\s+/)
-      .filter(w => w.length > 2 && !STOP_WORDS.has(w)),
-  );
-}
-
-function jaccardSimilarity(setA, setB) {
-  if (setA.size === 0 || setB.size === 0) return 0;
-  let intersection = 0;
-  for (const w of setA) if (setB.has(w)) intersection++;
-  return intersection / (setA.size + setB.size - intersection);
-}
-
-function deduplicateStories(stories) {
-  const clusters = [];
-  for (const story of stories) {
-    const words = extractTitleWords(story.title);
-    let merged = false;
-    for (const cluster of clusters) {
-      if (jaccardSimilarity(words, cluster.words) > 0.55) {
-        cluster.items.push(story);
-        merged = true;
-        break;
-      }
-    }
-    if (!merged) clusters.push({ words, items: [story] });
-  }
-  return clusters.map(({ items }) => {
-    items.sort((a, b) => b.currentScore - a.currentScore || b.mentionCount - a.mentionCount);
-    const best = { ...items[0] };
-    if (items.length > 1) {
-      best.mentionCount = items.reduce((sum, s) => sum + s.mentionCount, 0);
-    }
-    best.mergedHashes = items.map(s => s.hash);
-    return best;
-  });
-}
-
 // ── Digest content ────────────────────────────────────────────────────────────
+
+// Dedup lives in scripts/lib/brief-dedup.mjs (orchestrator) with the
+// legacy Jaccard in scripts/lib/brief-dedup-jaccard.mjs. The orchestrator
+// reads DIGEST_DEDUP_MODE at call time — default 'jaccard' keeps
+// behaviour identical to pre-embedding production. stripSourceSuffix
+// is imported from the Jaccard module so the text/HTML formatters
+// below keep their current per-story title cleanup.
 
 async function buildDigest(rule, windowStartMs) {
   const variant = rule.variant ?? 'full';
@@ -324,8 +378,72 @@ async function buildDigest(rule, windowStartMs) {
   if (stories.length === 0) return null;
 
   stories.sort((a, b) => b.currentScore - a.currentScore);
-  const deduped = deduplicateStories(stories);
-  const top = deduped.slice(0, DIGEST_MAX_ITEMS);
+  const cfg = readOrchestratorConfig(process.env);
+  const { reps: dedupedAll, embeddingByHash, logSummary } =
+    await deduplicateStories(stories);
+  // Apply the absolute-score floor AFTER dedup so the floor runs on
+  // the representative's score (mentionCount-sum doesn't change the
+  // score field; the rep is the highest-scoring member of its
+  // cluster). At DIGEST_SCORE_MIN=0 this is a no-op.
+  const scoreFloor = getDigestScoreMin();
+  const deduped = scoreFloor > 0
+    ? dedupedAll.filter((s) => Number(s.currentScore ?? 0) >= scoreFloor)
+    : dedupedAll;
+  if (scoreFloor > 0 && dedupedAll.length !== deduped.length) {
+    console.log(
+      `[digest] score floor dropped ${dedupedAll.length - deduped.length} ` +
+        `of ${dedupedAll.length} clusters (DIGEST_SCORE_MIN=${scoreFloor})`,
+    );
+  }
+  // If the floor drained every cluster, return null with a distinct
+  // log line so operators can tell "floor too high" apart from "no
+  // stories in window" (the caller treats both as a skip but the
+  // root causes are different — without this line the main-loop
+  // "No stories in window" message never fires because [] is truthy
+  // and silences the diagnostic at the caller's guard).
+  if (deduped.length === 0) {
+    if (scoreFloor > 0 && dedupedAll.length > 0) {
+      console.log(
+        `[digest] score floor dropped ALL ${dedupedAll.length} clusters ` +
+          `(DIGEST_SCORE_MIN=${scoreFloor}) — skipping user`,
+      );
+    }
+    return null;
+  }
+  const sliced = deduped.slice(0, DIGEST_MAX_ITEMS);
+
+  // Secondary topic-grouping pass: re-orders `sliced` so related stories
+  // form contiguous blocks. Disabled via DIGEST_DEDUP_TOPIC_GROUPING=0.
+  // Gate on the sidecar Map being non-empty — this is the precise
+  // signal for "primary embed path produced vectors". Gating on
+  // cfg.mode is WRONG: the embed path can run AND fall back to
+  // Jaccard at runtime (try/catch inside deduplicateStories), leaving
+  // cfg.mode==='embed' but embeddingByHash empty. The Map size is the
+  // only ground truth. Kill-switch (mode=jaccard) and runtime fallback
+  // both produce size=0 → shouldGroupTopics=false → no misleading
+  // "topic grouping failed: missing embedding" warn.
+  // Errors from the helper are returned (not thrown) and MUST NOT
+  // cascade into the outer Jaccard fallback — they just preserve
+  // primary order.
+  const shouldGroupTopics = cfg.topicGroupingEnabled && embeddingByHash.size > 0;
+  const { reps: top, topicCount, error: topicErr } = shouldGroupTopics
+    ? groupTopicsPostDedup(sliced, cfg, embeddingByHash)
+    : { reps: sliced, topicCount: sliced.length, error: null };
+  if (topicErr) {
+    console.warn(
+      `[digest] topic grouping failed, preserving primary order: ${topicErr.message}`,
+    );
+  }
+  if (logSummary) {
+    const finalLog =
+      shouldGroupTopics && !topicErr
+        ? logSummary.replace(
+            /clusters=(\d+) /,
+            `clusters=$1 topics=${topicCount} `,
+          )
+        : logSummary;
+    console.log(finalLog);
+  }
 
   const allSourceCmds = [];
   const cmdIndex = [];
@@ -642,9 +760,9 @@ function truncateTelegramHtml(html, limit = TELEGRAM_MAX_LEN) {
 
 /**
  * Phase 8: derive the 3 carousel image URLs from a signed magazine
- * URL. The HMAC token binds (userId, issueDate), not the path — so
- * the same token verifies against /api/brief/{u}/{d}?t=T AND against
- * /api/brief/carousel/{u}/{d}/{0|1|2}?t=T.
+ * URL. The HMAC token binds (userId, issueSlot), not the path — so
+ * the same token verifies against /api/brief/{u}/{slot}?t=T AND against
+ * /api/brief/carousel/{u}/{slot}/{0|1|2}?t=T.
  *
  * Returns null when the magazine URL doesn't match the expected shape
  * — caller falls back to text-only delivery.
@@ -652,13 +770,13 @@ function truncateTelegramHtml(html, limit = TELEGRAM_MAX_LEN) {
 function carouselUrlsFrom(magazineUrl) {
   try {
     const u = new URL(magazineUrl);
-    const m = u.pathname.match(/^\/api\/brief\/([^/]+)\/(\d{4}-\d{2}-\d{2})\/?$/);
+    const m = u.pathname.match(/^\/api\/brief\/([^/]+)\/(\d{4}-\d{2}-\d{2}-\d{4})\/?$/);
     if (!m) return null;
-    const [, userId, issueDate] = m;
+    const [, userId, issueSlot] = m;
     const token = u.searchParams.get('t');
     if (!token) return null;
     return [0, 1, 2].map(
-      (p) => `${u.origin}/api/brief/carousel/${userId}/${issueDate}/${p}?t=${token}`,
+      (p) => `${u.origin}/api/brief/carousel/${userId}/${issueSlot}/${p}?t=${token}`,
     );
   } catch {
     return null;
@@ -1142,22 +1260,35 @@ async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, 
     }
   }
 
-  const issueDate = envelope.data.date;
-  const key = `brief:${userId}:${issueDate}`;
+  // Slot (YYYY-MM-DD-HHMM in the user's tz) is what routes the
+  // magazine URL + Redis key. Using the same tz the composer used to
+  // produce envelope.data.date guarantees the slot's date portion
+  // matches the displayed date. Two same-day compose runs produce
+  // distinct slots so each digest dispatch freezes its own URL.
+  const briefTz = chosenCandidate?.digestTimezone ?? 'UTC';
+  const issueSlot = issueSlotInTz(nowMs, briefTz);
+  const key = `brief:${userId}:${issueSlot}`;
+  // The latest-pointer lets readers (dashboard panel, share-url
+  // endpoint) locate the most recent brief without knowing the slot.
+  // One SET per compose is cheap and always current.
+  const latestPointerKey = `brief:latest:${userId}`;
+  const latestPointerValue = JSON.stringify({ issueSlot });
   const pipelineResult = await redisPipeline([
     ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(envelope)],
+    ['SETEX', latestPointerKey, String(BRIEF_TTL_SECONDS), latestPointerValue],
   ]);
-  if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length === 0) {
+  if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length < 2) {
     throw new Error('null pipeline response from Upstash');
   }
-  const cell = pipelineResult[0];
-  if (cell && typeof cell === 'object' && 'error' in cell) {
-    throw new Error(`Upstash SETEX error: ${cell.error}`);
+  for (const cell of pipelineResult) {
+    if (cell && typeof cell === 'object' && 'error' in cell) {
+      throw new Error(`Upstash SETEX error: ${cell.error}`);
+    }
   }
 
   const magazineUrl = await signBriefUrl({
     userId,
-    issueDate,
+    issueDate: issueSlot,
     baseUrl: WORLDMONITOR_PUBLIC_BASE_URL,
     secret: BRIEF_URL_SIGNING_SECRET,
   });
@@ -1194,6 +1325,53 @@ async function main() {
     console.log('[digest] No digest rules found — nothing to do');
     return;
   }
+
+  // Operator single-user test filter. Self-expiring by design: the env
+  // var MUST carry an `|until=<ISO8601>` suffix within 48h, or it's
+  // IGNORED. Rationale: the naive `DIGEST_ONLY_USER=user_xxx` format
+  // from PR #3255 was a sticky footgun — if an operator set it for a
+  // one-off validation and forgot to unset it, the cron would silently
+  // filter out every other user indefinitely while still completing
+  // normally and exiting 0, creating a prolonged partial outage with
+  // "green" runs. Mandatory expiry + hard 48h cap + loud warn at run
+  // start makes the test surface self-cleanup even if the operator
+  // walks away.
+  //
+  // Format: DIGEST_ONLY_USER=user_xxxxxxxxxxxxxxxxxxxxxx|until=2026-04-22T18:00Z
+  // Legacy bare-userId format is rejected (fall-through to normal
+  // fan-out) with a loud warn explaining the new syntax.
+  const onlyUserFilter = parseDigestOnlyUser(
+    (process.env.DIGEST_ONLY_USER ?? '').trim(),
+    nowMs,
+  );
+  if (onlyUserFilter.kind === 'active') {
+    const remainingMin = Math.round((onlyUserFilter.untilMs - nowMs) / 60_000);
+    console.warn(
+      `⚠️  [digest] DIGEST_ONLY_USER ACTIVE — filtering to userId=${onlyUserFilter.userId}. ` +
+        `Expires in ${remainingMin} min (${new Date(onlyUserFilter.untilMs).toISOString()}). ` +
+        `All other users are EXCLUDED from this run. Unset DIGEST_ONLY_USER after testing.`,
+    );
+    const before = rules.length;
+    rules = rules.filter((r) => r && r.userId === onlyUserFilter.userId);
+    console.log(
+      `[digest] DIGEST_ONLY_USER — filtered ${before} rules → ${rules.length}`,
+    );
+    if (rules.length === 0) {
+      console.warn(
+        `[digest] No rules matched userId=${onlyUserFilter.userId} — nothing to do (exiting green).`,
+      );
+      return;
+    }
+  } else if (onlyUserFilter.kind === 'reject') {
+    // Malformed / expired / cap-exceeded — log LOUDLY and fan out normally
+    // so a forgotten flag cannot produce a silent partial outage.
+    console.warn(
+      `[digest] DIGEST_ONLY_USER present but IGNORED: ${onlyUserFilter.reason}. ` +
+        `Proceeding with normal fan-out. Format: ` +
+        `DIGEST_ONLY_USER=user_xxx|until=<ISO8601 within 48h>.`,
+    );
+  }
+  // kind === 'unset' → normal fan-out, no log (production default)
 
   // Compose per-user brief envelopes once per run (extracted so main's
   // complexity score stays in the biome budget). Failures MUST NOT

@@ -625,9 +625,12 @@ function shouldNotify(rule, event) {
   if (!passesLegacy) return false;
 
   if (process.env.IMPORTANCE_SCORE_LIVE === '1' && event.payload?.importanceScore != null) {
-    const threshold = rule.sensitivity === 'critical' ? 85
-                    : rule.sensitivity === 'high' ? 65
-                    : 40; // 'all'
+    // Calibrated from v5 shadow-log recalibration (2026-04-20).
+    // IMPORTANCE_SCORE_MIN env var controls the 'all' floor at both the
+    // relay ingress gate AND per-rule sensitivity — single tuning surface.
+    const threshold = rule.sensitivity === 'critical' ? 82
+                    : rule.sensitivity === 'high' ? 69
+                    : IMPORTANCE_SCORE_MIN;
     return event.payload.importanceScore >= threshold;
   }
 
@@ -691,7 +694,7 @@ const IMPORTANCE_SCORE_MIN = Number(process.env.IMPORTANCE_SCORE_MIN ?? 40);
 // The old v1 key (compact string format) is retained by consumers for
 // backward-compat reading but is no longer written. See
 // docs/internal/scoringDiagnostic.md §5 and §9 Step 4.
-const SHADOW_SCORE_LOG_KEY = 'shadow:score-log:v3';
+const SHADOW_SCORE_LOG_KEY = 'shadow:score-log:v5';
 const SHADOW_LOG_TTL = 7 * 24 * 3600; // 7 days
 
 async function shadowLogScore(event) {

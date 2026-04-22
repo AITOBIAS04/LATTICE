@@ -76,7 +76,12 @@ import { install as installCloudPrefsSync, onSignIn as cloudPrefsSignIn, onSignO
 import { getConvexClient, getConvexApi, waitForConvexAuth } from '@/services/convex-client';
 import { initEntitlementSubscription, destroyEntitlementSubscription, resetEntitlementState } from '@/services/entitlements';
 import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
-import { capturePendingCheckoutIntentFromUrl, resumePendingCheckout } from '@/services/checkout';
+import {
+  capturePendingCheckoutIntentFromUrl,
+  initCheckoutWatchers,
+  resumePendingCheckout,
+} from '@/services/checkout';
+import { captureReferralFromUrl } from '@/services/referral-capture';
 import {
   CorrelationEngine,
   militaryAdapter,
@@ -976,6 +981,22 @@ export class App {
     this.state.correlationEngine = correlationEngine;
     this.eventHandlers.setupUnifiedSettings();
     this.eventHandlers.setupAuthWidget();
+    // Capture any ?ref= / ?wm_referral= from the URL into localStorage
+    // and strip from the visible URL. Runs BEFORE the pending-checkout
+    // capture so a /pro?ref=X&checkoutProduct=Y landing preserves both
+    // signals. Pure read of current URL — no-op when neither param is
+    // present.
+    captureReferralFromUrl();
+    // Wire checkout-attempt lifecycle watchers (sign-out clear) before
+    // any capture/resume path runs, so a stale session from a prior
+    // user can't bleed into the current one.
+    initCheckoutWatchers();
+    // Stale attempt records are ignored by loadCheckoutAttempt() via
+    // the 24h TTL — no separate sweep needed. The attempt record's
+    // only consumer (the failure-retry banner) runs handleCheckoutReturn
+    // synchronously during panel-layout mount, which is after the
+    // captureePendingCheckoutIntentFromUrl repopulates it for any /pro
+    // handoff — so no race exists that would want to sweep pre-capture.
     const pendingCheckout = capturePendingCheckoutIntentFromUrl();
     if (pendingCheckout) {
       // Checkout intent from /pro page redirect. Resume immediately if
@@ -1336,7 +1357,7 @@ export class App {
     }
 
     // WTO trade policy data — annual data, poll every 10 min to avoid hammering upstream
-    if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance' || SITE_VARIANT === 'commodity') {
+    if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance' || SITE_VARIANT === 'commodity' || SITE_VARIANT === 'energy') {
       this.refreshScheduler.scheduleRefresh('tradePolicy', () => this.dataLoader.loadTradePolicy(), REFRESH_INTERVALS.tradePolicy, () => this.isPanelNearViewport('trade-policy'));
       this.refreshScheduler.scheduleRefresh('supplyChain', () => this.dataLoader.loadSupplyChain(), REFRESH_INTERVALS.supplyChain, () => this.isPanelNearViewport('supply-chain'));
     }

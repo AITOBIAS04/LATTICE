@@ -8,6 +8,17 @@ import { installUtmInterceptor } from './utils/utm';
 
 const sentryDsn = import.meta.env.VITE_SENTRY_DSN?.trim();
 
+// Known third-party hosts fetched by MapLibre (tiles, styles, glyphs, sprites).
+// Used by the beforeSend `Failed to fetch (<host>)` filter to avoid suppressing
+// failures from our self-hosted R2 PMTiles bucket or any api.worldmonitor.app
+// fetches that happen to land on a maplibre-framed stack.
+const MAPLIBRE_THIRD_PARTY_TILE_HOSTS = new Set([
+  'tilecache.rainviewer.com',
+  'basemaps.cartocdn.com',
+  'tiles.openfreemap.org',
+  'protomaps.github.io',
+]);
+
 // Initialize Sentry error tracking (early as possible)
 Sentry.init({
   dsn: sentryDsn || undefined,
@@ -116,7 +127,7 @@ Sentry.init({
     /(?:AbortError: )?The user aborted a request/,
     /\w+ is not a function.*\/uv\/service\//,
     /__isInQueue__/,
-    /^(?:LIDNotify(?:Id)?|onWebViewAppeared|onGetWiFiBSSID|onHide|onShow|onReady|tapAt|removeHighlight) is not defined$/,
+    /^(?:LIDNotify(?:Id)?|onWebViewAppeared|onGetWiFiBSSID|onHide|onShow|onReady|tapAt|removeHighlight|UTItemActionController) is not defined$/,
     /Se requiere plan premium/,
     /hybridExecute is not defined/,
     /reading 'postMessage'/,
@@ -272,9 +283,26 @@ Sentry.init({
     // Suppress any TypeError / RangeError that happens entirely within maplibre or deck.gl internals.
     // RangeError: "Invalid array length" during deck.gl bindVertexArray / _updateCache on large
     // GL layer updates (vertex-buffer allocation failure in vendor code — WORLDMONITOR-N4).
+    // EXCEPTION: `Failed to fetch (<host>)` is routed through the host-allowlist block below
+    // so a self-hosted R2 PMTiles / first-party basemap regression isn't silently dropped just
+    // because its stack happens to be all-vendor frames (WORLDMONITOR-NE/NF follow-up).
     const excType = event.exception?.values?.[0]?.type ?? '';
-    if ((excType === 'TypeError' || excType === 'RangeError' || /^(?:TypeError|RangeError):/.test(msg)) && frames.length > 0) {
+    const isMaplibreAjaxFailure = excType === 'TypeError' && /^Failed to fetch \([^)]+\)$/.test(msg);
+    if (!isMaplibreAjaxFailure
+        && (excType === 'TypeError' || excType === 'RangeError' || /^(?:TypeError|RangeError):/.test(msg))
+        && frames.length > 0) {
       if (nonInfraFrames.length > 0 && nonInfraFrames.every(f => /\/(map|maplibre|deck-stack)-[A-Za-z0-9_-]+\.js/.test(f.filename ?? ''))) return null;
+    }
+    // Suppress MapLibre AJAXError for third-party tile fetches: maplibre wraps transient
+    // network errors as `Failed to fetch (<hostname>)` and rethrows in a Generator-backed
+    // Promise that leaks to onunhandledrejection even though DeckGLMap's map-error handler
+    // already logs it as a warning. Allowlist KNOWN third-party tile/style/glyph hosts —
+    // leaves first-party fetch failures (self-hosted R2 PMTiles bucket, api.worldmonitor.app)
+    // to surface so a real basemap regression is never silently dropped (WORLDMONITOR-NE/NF).
+    if (isMaplibreAjaxFailure && frames.some(f => /\/maplibre-[A-Za-z0-9_-]+\.js/.test(f.filename ?? ''))) {
+      const hostMatch = msg.match(/^Failed to fetch \(([^)]+)\)$/);
+      const host = hostMatch?.[1];
+      if (host && MAPLIBRE_THIRD_PARTY_TILE_HOSTS.has(host)) return null;
     }
     // Suppress Three.js/globe.gl TypeError crashes in main bundle (reading 'type'/'pathType'/'count'/'__globeObjType' on undefined during WebGL traversal/raycast).
     // __globeObjType is exclusively set by three-globe on its own objects and we have no user onClick/onHover handler, so it is always globe.gl internal even when the stack shows the bundled main chunk (WORLDMONITOR-ME).
@@ -291,6 +319,25 @@ Sentry.init({
     // Match by function name pattern (_handleTouch*Dolly*) or suppress when no first-party frames.
     if (/undefined is not an object \(evaluating 't\.x'\)|Cannot read properties of undefined \(reading 'x'\)/.test(msg)) {
       if (!hasFirstParty || frames.some(f => /\b_handleTouch\w*Dolly|OrbitControls/.test(f.function ?? ''))) return null;
+    }
+    // Suppress Three.js OrbitControls pointer-capture race: pointerdown handler calls
+    // setPointerCapture but the browser has already released the pointer (focus change,
+    // rapid re-tap). OrbitControls is bundled into main-*.js, so hasFirstParty=true and
+    // production stacks are often unsymbolicated — require a positive three.js signature
+    // in the frame context (the literal `this._pointers … setPointerCapture` code slice)
+    // so an unrelated first-party setPointerCapture regression still surfaces (WORLDMONITOR-NC).
+    if (excType === 'NotFoundError' && /setPointerCapture.*No active pointer with the given id/.test(msg)) {
+      // Sentry wire format includes `context: [[lineno, text], ...]` per frame, but the
+      // SDK's StackFrame type omits it — cast to any to read it.
+      const hasOrbitControlsContext = frames.some(f => {
+        const ctx = (f as any).context;
+        if (!Array.isArray(ctx)) return false;
+        return ctx.some(row =>
+          Array.isArray(row) && typeof row[1] === 'string'
+          && /_pointers[^\n]*setPointerCapture|setPointerCapture[^\n]*_pointers/.test(row[1]),
+        );
+      });
+      if (hasOrbitControlsContext) return null;
     }
     // Suppress deck.gl/maplibre null-access crashes with no usable stack trace (requestAnimationFrame wrapping)
     if (/null is not an object \(evaluating '\w{1,3}\.(id|type|style)'\)/.test(msg) && frames.length === 0) return null;
@@ -354,6 +401,21 @@ Sentry.init({
     // origin. Empty stacks are NOT suppressed because we cannot confirm the error didn't
     // come from our own code (OOM, stack overflow, network failures all commonly arrive
     // without frames even when our code triggered them).
+    // iOS Safari WKWebView throws `UnknownError: Cannot inject key into script value`
+    // at the native bridge when a non-structurally-cloneable value is passed to a
+    // bridge API (history.pushState, IndexedDB, etc.). The throw is native; a first-
+    // party caller is always on the stack, so the generic `!hasFirstParty` gate below
+    // misses it. Scope to excType==='UnknownError' — that type name is WebKit-only and
+    // cannot originate from our TypeScript (WORLDMONITOR-NM).
+    if (excType === 'UnknownError' && /Cannot inject key into script value/.test(msg)) return null;
+    // Convex SDK re-auth race: during a WebSocket reconnect, `BaseConvexClient.
+    // tryToReauthenticate` can read `this.authState.config.fetchToken` while
+    // authState is transitioning out of `authenticated` state. Known Convex
+    // internal; we use the SDK as-is. Gate by the exact function name so we
+    // don't mask a genuine first-party `fetchToken` regression
+    // (WORLDMONITOR-NJ).
+    if (/Cannot read properties of undefined \(reading 'fetchToken'\)/.test(msg)
+        && frames.some(f => /tryToReauthenticate/.test(f.function ?? ''))) return null;
     if (hasAnyStack && !hasFirstParty && (
       /\.(?:toLowerCase|trim|indexOf|findIndex) is not a function/.test(msg)
       || /Maximum call stack size exceeded/.test(msg)

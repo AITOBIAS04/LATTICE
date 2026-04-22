@@ -161,7 +161,7 @@ const STANDALONE_KEYS = {
   pizzint:                  'intelligence:pizzint:seed:v1',
   resilienceStaticIndex:    'resilience:static:index:v1',
   resilienceStaticFao:      'resilience:static:fao',
-  resilienceRanking:        'resilience:ranking:v9',
+  resilienceRanking:        'resilience:ranking:v10',
   productCatalog:           'product-catalog:v2',
   energySpineCountries:     'energy:spine:v1:_countries',
   energyExposure:           'energy:exposure:v1:index',
@@ -188,6 +188,11 @@ const STANDALONE_KEYS = {
   recoveryExternalDebt:     'resilience:recovery:external-debt:v1',
   recoveryImportHhi:        'resilience:recovery:import-hhi:v1',
   recoveryFuelStocks:       'resilience:recovery:fuel-stocks:v1',
+  // PR 1 v2 energy-construct seeds. ON_DEMAND_KEYS until Railway cron
+  // provisions; see below.
+  lowCarbonGeneration:      'resilience:low-carbon-generation:v1',
+  fossilElectricityShare:   'resilience:fossil-electricity-share:v1',
+  powerLosses:              'resilience:power-losses:v1',
   goldExtended:             'market:gold-extended:v1',
   goldEtfFlows:             'market:gold-etf-flows:v1',
   goldCbReserves:           'market:gold-cb-reserves:v1',
@@ -291,7 +296,7 @@ const SEED_META = {
   fuelPrices:          { key: 'seed-meta:economic:fuel-prices',               maxStaleMin: 10080 }, // weekly seed; 10080 = 7 days
   faoFoodPriceIndex:   { key: 'seed-meta:economic:fao-ffpi',                  maxStaleMin: 86400 }, // monthly seed; 86400 = 60 days (2x interval)
   thermalEscalation:   { key: 'seed-meta:thermal:escalation',                 maxStaleMin: 360 }, // cron every 2h; 360 = 3x interval (was 240 = 2x)
-  nationalDebt:        { key: 'seed-meta:economic:national-debt',              maxStaleMin: 10080 }, // 7 days — monthly seed
+  nationalDebt:        { key: 'seed-meta:economic:national-debt',              maxStaleMin: 86400 }, // monthly seed (seed-bundle-macro intervalMs: 30 * DAY); 60d = 2x interval absorbs one missed run. Prior 10080 (7d) was narrower than the cron interval so every cron past day 7 alarmed STALE_SEED.
   tariffTrendsUs:      { key: 'seed-meta:trade:tariffs:v1:840:all:10',        maxStaleMin: 900 },
   // publish.ts runs once daily (02:30 UTC); seed-meta TTL=52h — maxStaleMin must cover the full 24h cycle
   consumerPricesOverview:   { key: 'seed-meta:consumer-prices:overview:ae',     maxStaleMin: 1500 }, // 25h = 24h cadence + 1h grace
@@ -310,7 +315,7 @@ const SEED_META = {
   ecbEuribor1y:      { key: 'seed-meta:economic:ecb-short-rates',   maxStaleMin: 4320 }, // shared meta key with ecbEstr
   gscpi:             { key: 'seed-meta:economic:gscpi',               maxStaleMin: 2880 }, // 24h interval; 2880min = 48h = 2x interval
   fearGreedIndex:    { key: 'seed-meta:market:fear-greed',            maxStaleMin: 720 }, // 6h cron; 720min = 12h = 2x interval
-  breadthHistory:    { key: 'seed-meta:market:breadth-history',       maxStaleMin: 2880 }, // daily cron at 21:00 ET; 2880min = 48h = 2x interval
+  breadthHistory:    { key: 'seed-meta:market:breadth-history',       maxStaleMin: 5760 }, // cron at 02:00 UTC, Tue-Sat (captures Mon-Fri market close); max gap Sat→Tue = 72h + 24h miss buffer = 96h = 5760min. 48h was wrong — alarmed every Monday morning when Sun+Mon are intentionally skipped.
   hormuzTracker:     { key: 'seed-meta:supply_chain:hormuz_tracker',  maxStaleMin: 2880 }, // daily cron; 2880min = 48h = 2x interval
   earningsCalendar:  { key: 'seed-meta:market:earnings-calendar',     maxStaleMin: 1440 }, // 12h cron; 1440min = 24h = 2x interval
   econCalendar:      { key: 'seed-meta:economic:econ-calendar',       maxStaleMin: 1440 }, // 12h cron; 1440min = 24h = 2x interval
@@ -379,6 +384,13 @@ const SEED_META = {
   recoveryExternalDebt:    { key: 'seed-meta:resilience:recovery:external-debt',    maxStaleMin: 86400 }, // monthly cron; 86400min = 60d = 2x interval
   recoveryImportHhi:       { key: 'seed-meta:resilience:recovery:import-hhi',       maxStaleMin: 86400 }, // monthly cron; 86400min = 60d = 2x interval
   recoveryFuelStocks:      { key: 'seed-meta:resilience:recovery:fuel-stocks',      maxStaleMin: 86400 }, // monthly cron; 86400min = 60d = 2x interval
+  // PR 1 v2 energy seeds — weekly cron (8d * 1440 = 11520min = 2x interval).
+  // Listed in ON_DEMAND_KEYS below until Railway cron provisions and
+  // the first clean run lands; after that they graduate to the normal
+  // SEED_META staleness check like the recovery seeds above.
+  lowCarbonGeneration:     { key: 'seed-meta:resilience:low-carbon-generation',     maxStaleMin: 11520 },
+  fossilElectricityShare:  { key: 'seed-meta:resilience:fossil-electricity-share',  maxStaleMin: 11520 },
+  powerLosses:             { key: 'seed-meta:resilience:power-losses',              maxStaleMin: 11520 },
 };
 
 // Standalone keys that are populated on-demand by RPC handlers (not seeds).
@@ -401,6 +413,13 @@ const ON_DEMAND_KEYS = new Set([
   'resilienceRanking', // on-demand RPC cache populated after ranking requests; missing before first Pro use is expected
   'recoveryFiscalSpace', 'recoveryReserveAdequacy', 'recoveryExternalDebt',
   'recoveryImportHhi', 'recoveryFuelStocks', // recovery pillar: stub seeders not yet deployed, keys may be absent
+  // PR 1 v2 energy-construct seeds. TRANSITIONAL: the three seeders
+  // ship with their health registry rows in this PR but Railway cron
+  // is provisioned as a follow-up action. Gated as on-demand until
+  // the first clean run lands; graduate out of this set after ~7 days
+  // of successful production cron runs (verify via
+  // `seed-meta:resilience:{low-carbon-generation,fossil-electricity-share,power-losses}.fetchedAt`).
+  'lowCarbonGeneration', 'fossilElectricityShare', 'powerLosses',
   'displacementPrev', // covered by cascade onto current-year displacement; empty most of the year
   'fxYoy', // TRANSITIONAL (PR #3071): seed-fx-yoy Railway cron deployed manually after merge —
            // gate as on-demand so a deploy-order race or first-cron-run failure doesn't
@@ -441,6 +460,7 @@ const EMPTY_DATA_OK_KEYS = new Set([
   'recoveryImportHhi', 'recoveryFuelStocks', // recovery pillar seeds: stub seeders write empty payloads until real sources are wired
   'ddosAttacks', 'trafficAnomalies', // zero events during quiet periods is valid, not critical
   'resilienceStaticFao', // empty aggregate = no IPC Phase 3+ countries this year (possible in theory); the key must exist but count=0 is fine
+  'cableHealth', // `cables: {}` = no active subsea cable disruptions per NGA NAVAREA warnings — all cables implicitly healthy. Also covers NGA-upstream-down windows where get-cable-health writes back the fallback response (empty cables); without this, those would alarm EMPTY_DATA.
 ]);
 
 // Cascade groups: if any key in the group has data, all empty siblings are OK.
@@ -677,21 +697,52 @@ export default async function handler(req, ctx) {
 
   const httpStatus = 200;
 
-  if (overall !== 'HEALTHY' && overall !== 'WARNING') {
+  if (overall !== 'HEALTHY') {
+    // problemKeys includes seedAgeMin for the snapshot (useful for post-mortem),
+    // but the dedupe signature uses only key:status (no age) so a long STALE_SEED
+    // window doesn't produce a new log entry on every poll.
     const problemKeys = Object.entries(checks)
-      .filter(([, c]) => c.status === 'EMPTY' || c.status === 'EMPTY_DATA' || c.status === 'STALE_SEED' || c.status === 'SEED_ERROR' || c.status === 'REDIS_PARTIAL')
+      .filter(([, c]) => c.status !== 'OK' && c.status !== 'OK_CASCADE' && c.status !== 'EMPTY_ON_DEMAND')
       .map(([k, c]) => `${k}:${c.status}${c.seedAgeMin != null ? `(${c.seedAgeMin}min)` : ''}`);
-    console.log('[health] %s crits=[%s]', overall, problemKeys.join(', '));
-    // Persist last failure snapshot for post-mortem. Vercel edge isolates can
-    // terminate before a fire-and-forget Promise resolves; ctx.waitUntil keeps
-    // the runtime alive until the write completes.
-    const persist = redisPipeline([['SET', 'health:last-failure', JSON.stringify({
+    const sigKeys = Object.entries(checks)
+      .filter(([, c]) => c.status !== 'OK' && c.status !== 'OK_CASCADE' && c.status !== 'EMPTY_ON_DEMAND')
+      .map(([k, c]) => `${k}:${c.status}`)
+      .sort();
+    console.log('[health] %s problems=[%s]', overall, problemKeys.join(', '));
+    const snapshot = {
       at: new Date(now).toISOString(),
       status: overall,
       critCount,
-      crits: problemKeys,
-    }), 'EX', 86400]]).catch(() => {});
+      warnCount: realWarnCount,
+      problems: problemKeys,
+    };
+    // Dedupe: only LPUSH when the incident signature (status + problem set,
+    // excluding seedAgeMin) changes. Read the previous sig first, then write
+    // everything (last-failure + sig + LPUSH) in one atomic pipeline so the
+    // sig only advances when the LPUSH succeeds. If the pipeline fails, the
+    // sig stays stale and the next poll retries the append.
+    const sig = `${overall}|${sigKeys.join(',')}`;
+    const prevSigResult = await redisPipeline([['GET', 'health:failure-log-sig']], 4_000).catch(() => null);
+    const prevSig = prevSigResult?.[0]?.result ?? '';
+    const persistCmds = [
+      ['SET', 'health:last-failure', JSON.stringify(snapshot), 'EX', 86400],
+    ];
+    if (sig !== prevSig) {
+      persistCmds.push(
+        ['LPUSH', 'health:failure-log', JSON.stringify(snapshot)],
+        ['LTRIM', 'health:failure-log', 0, 49],
+        ['EXPIRE', 'health:failure-log', 86400 * 7],
+        ['SET', 'health:failure-log-sig', sig, 'EX', 86400],
+      );
+    }
+    const persist = redisPipeline(persistCmds, 4_000).catch(() => {});
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
+  } else {
+    // Clear the sig on recovery so a recurrence of the same problem set
+    // after a healthy gap is logged as a new incident, not deduped against
+    // the previous one.
+    const clear = redisPipeline([['DEL', 'health:failure-log-sig']], 4_000).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(clear);
   }
 
   const url = new URL(req.url);

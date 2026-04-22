@@ -280,3 +280,30 @@ describe('brief magazine CSP override', () => {
     }
   });
 });
+
+// PR history: #3204 / #3206 forced the resvg linux-x64-gnu native
+// binding into the carousel function via vercel.json
+// `functions.includeFiles`. That entire workaround became unnecessary
+// once the route moved to @vercel/og on Edge runtime (see
+// api/brief/carousel/...), which bundles satori + resvg-wasm with
+// Vercel-native support. The `functions` block was removed.
+//
+// If any future route ever needs a Vercel `functions` config, keep
+// in mind: the keys are micromatch globs, NOT literal paths.
+// `[userId]` is a character class (match one of u/s/e/r/I/d), not a
+// dynamic segment placeholder. Use `api/foo/**` for routes with
+// dynamic brackets. See skill `vercel-native-binding-peer-dep-missing`
+// for the full story.
+describe('vercel.json functions config (none expected after carousel moved to edge)', () => {
+  it('does not define any `functions` block (carousel now uses @vercel/og on edge)', () => {
+    assert.equal(
+      vercelConfig.functions,
+      undefined,
+      'No routes currently require a functions config. If adding one, ' +
+        'remember Vercel treats the key as a micromatch glob — ' +
+        '`[userId]` will silently match one of {u,s,e,r,I,d} and your ' +
+        'rule will apply to nothing. See skill ' +
+        'vercel-native-binding-peer-dep-missing for the gotcha.',
+    );
+  });
+});
