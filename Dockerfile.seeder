@@ -1,0 +1,25 @@
+# Dockerfile.seeder — image that RUNS the WorldMonitor seeders on a schedule.
+#
+# The main Dockerfile builds the API server (nginx) and its runtime stage does
+# NOT ship scripts/, so it cannot run the seeders. The seed scripts also import
+# across the repo (scripts/, api/, server/, shared/, tests/helpers) — see
+# run-seeders.sh "seeders run on the host" — so this image copies the full
+# source and installs deps. run-seeders.sh iterates scripts/seed-*.mjs and
+# tolerates per-seed failures; it writes to Upstash via the REST env vars
+# (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN) set on the Railway service.
+#
+# Used by the Railway cron service `wm-seeder-cron` via RAILWAY_DOCKERFILE_PATH.
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies first (cache layer). --ignore-scripts mirrors the main
+# Dockerfile's builder stage (avoids native postinstall failures on alpine).
+COPY package.json package-lock.json ./
+RUN npm install --ignore-scripts --no-audit --no-fund
+
+# Full source — the seeders import across scripts/, api/, server/, shared/, tests/.
+COPY . .
+
+# run-seeders.sh runs every scripts/seed-*.mjs once and exits (cron-friendly).
+CMD ["sh", "scripts/run-seeders.sh"]
