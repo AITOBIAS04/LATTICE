@@ -608,12 +608,17 @@ export function parseCREStationPrices(xml) {
   return { regular: collect('regular'), diesel: collect('diesel') };
 }
 
-// Sources whose failure must not gate publish. Brazil ANP (gov.br) is
-// unreachable from Railway IPs both ways: Decodo proxy 403s all .gov.br
-// CONNECTs by policy, and direct fetch fails undici TLS handshake. Until a
-// working route is found, gating publish on Brazil's freshness means every
-// run exits 1 → Railway "Deployment crashed" banner + STALE_SEED flip.
-const TOLERATED_FAILURES = new Set(['Brazil']);
+// Sources whose failure must not gate publish. These are the three
+// datacenter-blocked sources the PROXY warning names (NZ/BR/MX): each is
+// structurally unreachable from Railway IPs without a working PROXY_URL —
+// Brazil ANP (gov.br) fails undici TLS + Decodo 403s .gov.br CONNECTs; NZ MBIE
+// sits behind Cloudflare bot-protection (returns an HTML challenge, not CSV);
+// MX CRE has intermittent IPv4 routing. Gating publish on any of them means a
+// datacenter cron run exits 1 → "Deployment crashed" + STALE_SEED, while
+// US/GB/MY + EU-27 (≥30 countries) are healthy. Restore them by setting
+// PROXY_URL; until then their failure is tolerated (the missing 1-3 countries
+// don't gate the 30+ healthy ones).
+const TOLERATED_FAILURES = new Set(['Brazil', 'Mexico', 'New Zealand']);
 
 // Publish gate. Exported so tests can lock in the contract.
 //
