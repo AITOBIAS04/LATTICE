@@ -9,16 +9,18 @@ unchanged. It is used by AITOBIAS04 (Echelon) as a self-hosted data component.
 
 The source code for a running deployment of this fork is this repository at the deployed commit.
 A deployment reports that commit at `/api/source`, and the web app footer links to it
-("Source (modified fork)"). Repository: https://github.com/AITOBIAS04/LATTICE
+("Source (modified fork)"), when the build knows the commit; otherwise both point to the repository.
+The Railway seeder services build from this repository's `main` branch. Repository: https://github.com/AITOBIAS04/LATTICE
 
 ## Modifications
 
-Changes relative to upstream `koala73/worldmonitor` (last merged upstream commit `a17a3383`, 2026-04-22):
+Changes relative to upstream `koala73/worldmonitor` (last merged upstream commit `a17a3383`, 2026-04-22). Dates are author dates;
+the April commits were rebased onto that upstream commit:
 
 | Date | Commit | Change |
 |------|--------|--------|
 | 2026-04-14 | `a29f40fd` | `vercel.json`: removed `ignoreCommand` |
-| 2026-04-21 | `d6b150b4`, `83ea341c` | Build: lockfile and `npm install` changes for the Railway Docker build (`Dockerfile`) |
+| 2026-04-21 | `d6b150b4`, `83ea341c` | `Dockerfile`: `npm ci` to `npm install` (a lockfile dedupe was tried and reverted) |
 | 2026-04-21 | `0f5824f7` | `docker/build-handlers.mjs`: mark satori, @resvg and yoga-wasm-web as external |
 | 2026-04-21 | `f1d84892`, `4959bd9f`, `536394d3` | `.vercelignore`: exclude Railway-only code from Vercel deploys |
 | 2026-04-21 | `17a66df4`, `9319b3bf` | `middleware.ts`: access gate for Echelon-only hosts |
