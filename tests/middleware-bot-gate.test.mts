@@ -195,3 +195,22 @@ describe('middleware PUBLIC_API_PATHS — secret-authed internal endpoints bypas
     }
   }
 });
+
+// AGPL-3.0 section 13 source offer: on the Echelon-only hosts, /api/source must
+// stay reachable without auth (and past the UA gate), and the 401 for any other
+// path must point at it.
+describe('middleware Echelon-only host / AGPL source offer', () => {
+  const HOST = 'https://lattice-echelons-projects-87c94757.vercel.app';
+
+  it('lets an unauthenticated client reach /api/source', () => {
+    assert.equal(call(`${HOST}/api/source`, GENERIC_CURL_UA), undefined);
+    assert.equal(call(`${HOST}/api/source`, CHROME_UA), undefined);
+  });
+
+  it('points the 401 on other paths at /api/source', async () => {
+    const res = call(`${HOST}/api/notifications`, CHROME_UA);
+    assert.ok(res instanceof Response);
+    assert.equal(res.status, 401);
+    assert.deepEqual(await res.json(), { error: 'Unauthorized', source: '/api/source' });
+  });
+});

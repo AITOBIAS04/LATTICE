@@ -1,5 +1,7 @@
 # World Monitor
 
+> **Modified fork.** This repository (AITOBIAS04/LATTICE) is a modified version of World Monitor by Elie Habib, licensed under AGPL-3.0. See [NOTICE.md](NOTICE.md) for the modifications and dates, and for where to get the source of a deployment.
+
 **Real-time global intelligence dashboard** — AI-powered news aggregation, geopolitical monitoring, and infrastructure tracking in a unified situational awareness interface.
 
 [![GitHub stars](https://img.shields.io/github/stars/koala73/worldmonitor?style=social)](https://github.com/koala73/worldmonitor/stargazers)

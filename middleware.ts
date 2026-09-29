@@ -20,9 +20,11 @@ const SOCIAL_PREVIEW_PATHS = new Set(['/api/story', '/api/og-story']);
 //   Node undici default UA, which is short enough to trip the "no UA or
 //   suspiciously short" 403 below (Railway log 2026-04-21 post-#3248 merge:
 //   every cron call returned 403 and silently fell back to legacy Gemini).
+// - /api/source: AGPL-3.0 section 13 source offer; static, no data, public.
 const PUBLIC_API_PATHS = new Set([
   '/api/version',
   '/api/health',
+  '/api/source',
   '/api/seed-contract-probe',
   '/api/internal/brief-why-matters',
 ]);
@@ -107,7 +109,8 @@ const WM_KEY_SHAPE_EARLY = /^wm_[a-f0-9]{32,}$/;
 
 // Paths a monitoring/health probe may hit unauthenticated even on Echelon-only
 // hosts. Keep this list narrow — anything here is fully public on the alias.
-const ECHELON_HOST_PUBLIC_PATHS = new Set(['/api/version', '/api/health']);
+// /api/source is the AGPL-3.0 section 13 source offer for this modified fork.
+const ECHELON_HOST_PUBLIC_PATHS = new Set(['/api/version', '/api/health', '/api/source']);
 
 export default function middleware(request: Request) {
   const url = new URL(request.url);
@@ -127,7 +130,7 @@ export default function middleware(request: Request) {
     const okByEchelonAuth = authSecret !== '' && providedEchelonAuth === authSecret;
     const okByWmKey = WM_KEY_SHAPE_EARLY.test(providedWmKey);
     if (!okByEchelonAuth && !okByWmKey) {
-      return new Response('{"error":"Unauthorized"}', {
+      return new Response('{"error":"Unauthorized","source":"/api/source"}', {
         status: 401,
         headers: { 'Content-Type': 'application/json' },
       });
