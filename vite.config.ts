@@ -651,6 +651,13 @@ export default defineConfig(({ mode }) => {
   return {
     define: {
       __APP_VERSION__: JSON.stringify(pkg.version),
+      // AGPL-3.0 section 13: Corresponding Source for this modified fork, at the
+      // commit being built when the build knows it (see NOTICE.md).
+      __SOURCE_URL__: JSON.stringify(
+        process.env.VERCEL_GIT_COMMIT_SHA
+          ? `https://github.com/AITOBIAS04/LATTICE/tree/${process.env.VERCEL_GIT_COMMIT_SHA}`
+          : 'https://github.com/AITOBIAS04/LATTICE',
+      ),
     },
     plugins: [
       htmlVariantPlugin(activeMeta, activeVariant, isDesktopBuild),
