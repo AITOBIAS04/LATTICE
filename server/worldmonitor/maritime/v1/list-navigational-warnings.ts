@@ -7,6 +7,7 @@ import type {
 
 import { CHROME_UA } from '../../../_shared/constants';
 import { cachedFetchJson } from '../../../_shared/redis';
+import { ngaWarningRecords } from '../../../_shared/nga-warnings';
 
 const REDIS_CACHE_KEY = 'maritime:navwarnings:v1';
 const REDIS_CACHE_TTL = 3600; // 1 hr — NGA broadcasts update daily
@@ -44,7 +45,7 @@ async function fetchNgaWarnings(area?: string): Promise<NavigationalWarning[]> {
     if (!response.ok) return [];
 
     const data = await response.json();
-    const rawWarnings: any[] = Array.isArray(data) ? data : (data?.broadcast_warn ?? []);
+    const rawWarnings: any[] = ngaWarningRecords(data);
 
     let warnings: NavigationalWarning[] = rawWarnings.map((w: any): NavigationalWarning => ({
       id: `${w.navArea || ''}-${w.msgYear || ''}-${w.msgNumber || ''}`,

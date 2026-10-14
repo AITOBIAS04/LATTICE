@@ -10,6 +10,7 @@ import type {
 import { cachedFetchJson, setCachedJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS } from './_shared';
 import { CHROME_UA } from '../../../_shared/constants';
+import { ngaWarningRecords } from '../../../_shared/nga-warnings';
 
 // ========================================================================
 // Constants
@@ -176,7 +177,7 @@ async function fetchNgaWarnings(): Promise<NgaWarning[] | null> {
     );
     if (!res.ok) return null; // fetch failed — don't cache, let sentinel TTL govern retry
     const data = await res.json();
-    return Array.isArray(data) ? data : (data as { warnings?: NgaWarning[] })?.warnings ?? [];
+    return ngaWarningRecords<NgaWarning>(data);
   } catch {
     return null; // network error — don't poison NGA cache with empty data
   }
